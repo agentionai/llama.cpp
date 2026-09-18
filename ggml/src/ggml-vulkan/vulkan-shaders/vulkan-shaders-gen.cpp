@@ -50,6 +50,7 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+    "ptq1_0",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -259,12 +260,18 @@ bool is_rocmfpx_quant(const std::string& type_name) {
 // Types whose mul_mm A-load is a per-type SPIR-V (DATA_A_<TYPE> define) rather than a
 // case of the unified MULMAT_QUANT shader. The ROCmFPx types keep their own shader too:
 // their decode needs the codebook/UE4M3 tables, the same shape as the IQ/FP4 types.
+// Trellis/ternary types (agention): per-type mul_mm SPIR-V like the LUT types, no coopmat2
+bool is_trellis_quant(const std::string& type_name) {
+    return type_name == "ptq1_0";
+}
+
 bool is_lut_quant(const std::string& type_name) {
-    return is_iq_quant(type_name) || type_name == "mxfp4" || type_name == "nvfp4" || is_rocmfpx_quant(type_name);
+    return is_iq_quant(type_name) || type_name == "mxfp4" || type_name == "nvfp4" || is_rocmfpx_quant(type_name) || is_trellis_quant(type_name);
 }
 
 std::string lut_load_vec_a(const std::string& type_name) {
-    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs") {
+    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs" ||
+        type_name == "ptq1_0") {
         return "8";
     }
     return "4";
@@ -609,6 +616,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
     for (const auto& tname : type_names) {
         if (tname == "bf16") {
+            continue;
+        }
+        // PTQ1_0 has no coopmat2 decoder: dequant_funcs_cm2.glsl carries no PTQ1_0 entry,
+        // so emitting mul_mm_cm2 for it fails shader compilation and takes the whole
+        // Vulkan build down, not just this type. Skip it; it falls back to the scalar and
+        // coopmat1 matmul paths, which are the ones implemented and tested.
+        if (coopmat2 && is_trellis_quant(tname)) {
             continue;
         }
 
