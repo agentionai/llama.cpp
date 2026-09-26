@@ -77,6 +77,27 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // [TAG_QSA_POOLED_CACHE] the dirty_* tensors are optional: when given, blk_cells and
+    // blk_pos may be null (the caller has nothing else to build them for), and the fill
+    // instead resolves which blocks must be (re)pooled this ubatch - the block ids from the
+    // sequence's watermark to its last complete block - and advances the watermark.
+    //   dirty_cells I32 [ratio*n_dirty_max, 1]  cells of each block to (re)pool, 0-padded
+    //   dirty_pos   I32 [4*n_dirty_max]         mrope position rows of those blocks
+    //   dirty_rows  I64 [n_dirty_max]           pooled-cache rows to write, dustbin-padded
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias,
+                       ggml_tensor * dirty_cells = nullptr, ggml_tensor * dirty_pos = nullptr,
+                       ggml_tensor * dirty_rows = nullptr) const;
+
     // [TAG_QSA_POOLED_CACHE]
     // Cache of the indexer's block summary keys (mean-pooled, normalized, roped), one f32
     // row per position block per QSA layer, written by the graph via set_rows. Only
@@ -95,6 +116,11 @@ public:
 
     // blocks of seq_id whose pooled rows are known valid; mutable via a const context, like the KV cache's own state
     int64_t & pooled_valid(llama_seq_id seq_id) const;
+
+    // [TAG_QSA_POOLED_CACHE] the cache rows are keyed by the compacted block id, which only
+    // stays put while the stream holds a single sequence with no repeated (mrope image)
+    // positions; this says whether a ubatch may take the pooled path
+    bool pooled_usable(const llama_ubatch & ubatch) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -115,6 +141,10 @@ private:
     uint32_t pooled_rows = 0;
 
     mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
+
+    // the last QSA fill saw repeated positions (mrope images), so block ids are ranked and the
+    // pooled cache is off; true until a fill proves otherwise, and again after any reset
+    mutable bool pooled_dup = true;
 
     // clamp helpers, one per llama_memory_i operation that can invalidate rows
     void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
@@ -157,27 +187,13 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and for the update context, which builds no sparse graph
+    // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    // [TAG_QSA_POOLED_CACHE] the dirty_* tensors are optional: when given, blk_cells and
-    // blk_pos may be null (the caller has nothing else to build them for), and the fill
-    // instead resolves which blocks must be (re)pooled this ubatch - the range from the
-    // sequence's watermark to its last complete block - and advances the watermark.
-    //   dirty_cells I32 [ratio*n_dirty_max, 1]  cells of each block to (re)pool, 0-padded
-    //   dirty_pos   I32 [4*n_dirty_max]         mrope position rows of those blocks
-    //   dirty_rows  I64 [n_dirty_max]           pooled-cache rows to write, dustbin-padded
+    // forwards to llama_memory_hybrid_idx::set_input_qsa
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias,
@@ -194,6 +210,9 @@ public:
     // watermark; stable at 1 during steady decode so graph reuse holds
     uint32_t qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const;
 
+    // [TAG_QSA_POOLED_CACHE] whether this ubatch may use the pooled cache (see llama_memory_hybrid_idx::pooled_usable)
+    bool qsa_pooled_usable(const llama_ubatch & ubatch) const;
+
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
 
@@ -201,7 +220,7 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch or full context
+    // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
