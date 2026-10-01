@@ -726,7 +726,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (mtp_draft != nullptr && n_outputs == 1) {
+        // --spec-draft-mtp-vocab: this context drafts over a row subset of the LM head and scatters
+        // its logits into a full-vocab row of -inf (as in the qwen35/qwen35moe MTP graphs). Only the
+        // draft changes; the target still verifies against the full vocabulary.
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, model.output_s);
+        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
