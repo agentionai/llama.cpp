@@ -1249,6 +1249,11 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
+        // qwen4exp: read the n-gram hash-embedding rows with the parallel reader (--ngram-on-disk)
+        // instead of page-faulting the mapped table one 4 KiB page at a time
+        if (const char * e = getenv("LLAMA_ARG_NGRAM_ON_DISK")) {
+            mparams.ple_on_disk = atoi(e) != 0;
+        }
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
