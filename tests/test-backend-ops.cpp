@@ -10422,12 +10422,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Trellis types in a small Flash-Next-like MoE (10 of 32 experts; gate/up-like k = 640 = 5 blocks,
-    // down-like m = 640): mat-vec (n <= 8, incl. the multi-token MoE kernel), the n = 9 / 32 fallback
-    // through the dequant + BLAS path, and the fused gate/up mat-vec.
+    // down-like m = 640): mat-vec (n <= 8, incl. the multi-token MoE kernel), the batched path for
+    // n >= 9 (CUDA/HIP: MMQ with the trellis tile loader; GGML_CUDA_TQ_MMQ=0: dequant + BLAS),
+    // and the fused gate/up mat-vec.
     for (ggml_type type_a : {GGML_TYPE_TQ2_T, GGML_TYPE_TQK6, GGML_TYPE_TQK7}) {
-        for (int n : {1, 2, 4, 8, 9, 32}) {
+        for (int n : {1, 2, 4, 8, 9, 16, 32, 64, 256, 512}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, n, 256));
+        }
+        // broadcast src1 (ne11 == 1), row count not a multiple of the MMQ tile (fallback tiles)
+        for (int n : {16, 63, 513}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true, 128, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 200, n, 384));
+        }
+        // Flash-Next expert matrix shapes (gate/up 2560 -> 640, down 640 -> 2560) with 32 instead of 512 experts
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, 64, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, 64, 640));
+        // dense MUL_MAT on the batched path
+        for (int n : {9, 16, 64, 256, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 129, n, 640, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 1024, {2, 1}, {1, 1}));
         }
         for (int n : {1, 4}) {
             test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640, 1));
@@ -11550,6 +11564,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : {GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQ2_T, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) { // k=640: no 256-blocks
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, bs, 2560));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, bs, 640));
+        }
+    }
+
+    // Same Flash-Next expert shapes with 32 experts (10 used): fast to set up with the CPU trellis encoder.
+    // bs = 32 has ~10 tokens per expert, like pp512 on the real 512-expert model.
+    for (int bs : {32, 128, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_TQK6, GGML_TYPE_TQK7, GGML_TYPE_TQ2_T, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, bs, 2560));
+            if (ggml_blck_size(type_a) == 128) { // k = 640 is not a multiple of the 256-weight super-blocks
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 2560, bs, 640));
+            }
         }
     }
 
