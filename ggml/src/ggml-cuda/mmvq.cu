@@ -63,9 +63,16 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+#ifndef GGML_CUDA_TQ_F32_DOT
+        // the kernels below load the int8 codebook into shared memory first (tq_lut_i8_load_shared)
+        case GGML_TYPE_TQ2_T:   return vec_dot_tq_q8_1_s<GGML_TYPE_TQ2_T>;
+        case GGML_TYPE_TQK6:    return vec_dot_tq_q8_1_s<GGML_TYPE_TQK6>;
+        case GGML_TYPE_TQK7:    return vec_dot_tq_q8_1_s<GGML_TYPE_TQK7>;
+#else
         case GGML_TYPE_TQ2_T:   return vec_dot_tq_q8_1<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:    return vec_dot_tq_q8_1<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:    return vec_dot_tq_q8_1<GGML_TYPE_TQK7>;
+#endif
         default:                return nullptr;
     }
 }
@@ -629,6 +636,11 @@ static __global__ void mul_mat_vec_q(
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
+#ifndef GGML_CUDA_TQ_F32_DOT
+    if constexpr (ggml_cuda_type_is_tq(type)) {
+        tq_lut_i8_load_shared(tid, nwarps*warp_size); // independent of the previous kernel: before the PDL sync
+    }
+#endif
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -906,6 +918,12 @@ static __global__ void mul_mat_vec_q_moe(
 
     const uint32_t channel_dst = blockIdx.y;
 
+#ifndef GGML_CUDA_TQ_F32_DOT
+    if constexpr (ggml_cuda_type_is_tq(type)) {
+        tq_lut_i8_load_shared(threadIdx.y*warp_size + threadIdx.x, blockDim.y*warp_size); // all threads, before any return
+    }
+#endif
+
     if (token_idx >= ncols_dst) {
         return;
     }
@@ -1137,6 +1155,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
             if (ncols_dst == 1 &&
                     std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
                 use = false;
+            }
+            // Trellis types: a 128-thread block per row leaves the codebook gathers latency bound (one or two
+            // lanes per thread); computing nwarps rows per block gives each thread nwarps independent rows and
+            // shares the block's shared-memory codebook load. Only when the rows divide evenly: the kernel does
+            // not guard its weight reads past the last row (expert matrices: 640 / 2560 rows).
+            if (ncols_dst == 1 && ggml_cuda_type_is_tq(type) && nwarps > 1 && nrows_x % nwarps == 0) {
+                static const bool tq_rows = [] { const char * e = getenv("GGML_CUDA_TQ_MMVQ_ROWS"); return !e || atoi(e) != 0; }();
+                use = use || tq_rows;
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||

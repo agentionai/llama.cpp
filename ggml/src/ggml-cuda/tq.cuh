@@ -151,6 +151,45 @@ static __device__ __forceinline__ float vec_dot_tq_q8_1(
 #endif
 }
 
+#ifndef GGML_CUDA_TQ_F32_DOT
+// Shared-memory copy of the int8 codebook for the mat-vec kernels (mmvq.cu fills it at kernel start with
+// tq_lut_i8_load_shared): random 2-byte gathers from shared memory instead of the L1 cache.
+static __shared__ __align__(16) uint16_t tq_lut_i8_s[TQ_LUT_POINTS];
+
+static __device__ __forceinline__ void tq_lut_i8_load_shared(const int tid, const int nthreads) {
+    const uint4 * src = (const uint4 *) tq_lut_i8;
+    uint4       * dst = (uint4 *) tq_lut_i8_s;
+    for (int i = tid; i < TQ_LUT_POINTS*2/16; i += nthreads) {
+        dst[i] = src[i];
+    }
+    __syncthreads();
+}
+
+// vec_dot_tq_q8_1 reading the shared codebook (only for kernels that called tq_lut_i8_load_shared).
+template <ggml_type type>
+static __device__ __forceinline__ float vec_dot_tq_q8_1_s(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    typedef typename tq_block_info<type>::block_t block_t;
+    const block_t * b = (const block_t *) vbq + kbx;
+    const int l = iqs / VDR_TQ_Q8_1_MMVQ;
+
+    uint32_t s[TQ_STEPS_LANE];
+    tq_states4<type>(b->qs, l, s);
+
+    const block_q8_1 * b8 = bq8_1 + l/2;
+    const int * q8 = (const int *) b8->qs + 4*(l & 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < TQ_STEPS_LANE; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        const uint32_t w = (uint32_t) tq_lut_i8_s[x >> 21] | ((uint32_t) tq_lut_i8_s[(x >> 10) & 2047u] << 16);
+        sumi = ggml_cuda_dp4a((int) w, q8[i], sumi);
+    }
+    return __half2float(b->d) * (__low2float(b8->ds) * TQ_LUT_I8_SCALE) * (float) sumi;
+}
+#endif // GGML_CUDA_TQ_F32_DOT
+
 // MMQ (batched) path: lane l of block x as 16 int8 values (4 packed ints, weight order) with
 // one float scale per lane, i.e. weights ~= scale * q. The codebook values of the lane are
 // requantized symmetrically against their own max |value| (per-16 scales, the Q8_0_16 tile
@@ -159,11 +198,11 @@ template <ggml_type type>
 static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int l, int q[TQ_STEPS_LANE]) {
     typedef typename tq_block_info<type>::block_t block_t;
     const block_t * b = (const block_t *) x;
-    const uint32_t * lut = tq_lut_global();
 
     uint32_t s[TQ_STEPS_LANE];
     tq_states4<type>(b->qs, l, s);
 
+    const uint32_t * lut = tq_lut_global();
     float v[16];
     float amax = 0.0f;
 #pragma unroll
