@@ -251,7 +251,10 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    // The MMQ kernels (and the stream-k fixup) load a tile's J destination ids from col_low + jt*J, i.e. up to
+    // J-1 entries past ne_get_rows for the last expert: pad by 128 (switch_J's largest J). Uninitialized: those
+    // entries only belong to columns past tile_y_max_j, which are never written.
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + 128);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and

@@ -444,7 +444,21 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
     }
 
+    // GGML_CUDA_POOL_EXACT=1 (debugging, legacy pool i.e. GGML_CUDA_NO_VMM builds): every allocation is its own
+    // exact-size cudaMalloc, freed on release, so compute-sanitizer memcheck sees out-of-bounds reads of pool buffers.
+    static bool exact_mode() {
+        static const bool exact = [] { const char * e = getenv("GGML_CUDA_POOL_EXACT"); return e && atoi(e) != 0; }();
+        return exact;
+    }
+
     void * alloc(size_t size, size_t * actual_size) override {
+        if (exact_mode()) {
+            void * ptr = nullptr;
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(ggml_cuda_device_malloc(&ptr, size > 0 ? size : 1, device));
+            *actual_size = size;
+            return ptr;
+        }
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -510,6 +524,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        if (exact_mode()) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(ptr)); // synchronizes: kernels still reading the buffer finish first
+            return;
+        }
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
