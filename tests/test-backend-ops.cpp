@@ -10435,6 +10435,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
 
+    // MUL_MAT_ID batched (MMQ) path, y-buffer tail padding (A6000 crash with 2 concurrent prompts, 2026-10-03):
+    // the last tile of the last expert with tokens reads up to J-1 columns past the y data, J chosen from the
+    // token count (up to 128), so the padding must not follow ne11 (1 when broadcast, n_used otherwise).
+    // Mainline types share the path; the GGML_ASSERT in mul_mat_q_switch_J checks the padding on every call.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_TQK6}) {
+        for (int n : {3, 5, 17, 324, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true,  640, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 256, n, 640));
+        }
+    }
+
     // Trellis types in a small Flash-Next-like MoE (10 of 32 experts; gate/up-like k = 640 = 5 blocks,
     // down-like m = 640): mat-vec (n <= 8, incl. the multi-token MoE kernel), the batched path for
     // n >= 9 (CUDA/HIP: MMQ with the trellis tile loader; GGML_CUDA_TQ_MMQ=0: dequant + BLAS),

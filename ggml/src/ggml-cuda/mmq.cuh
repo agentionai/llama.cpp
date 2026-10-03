@@ -1414,6 +1414,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    int64_t y_pad_cols = -1; // MUL_MAT_ID: columns of tail padding after the y data (a tile reads up to J-1 past it)
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1531,6 +1532,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             ntiles_J_best = ntiles_x;
         }
     }
+
+    // MUL_MAT_ID: the last tile of the last expert with tokens can start one column before the end of the y data
+    // and reads J columns, so the y buffer needs J_best - 1 columns of tail padding.
+    GGML_ASSERT(args.expert_bounds == nullptr || args.y_pad_cols < 0 || J_best - 1 <= args.y_pad_cols);
 
     switch (J_best) {
         case   8:

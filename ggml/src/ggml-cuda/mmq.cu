@@ -4,6 +4,10 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <vector>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -264,9 +268,57 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // Tail padding of the y buffer, in columns. A tile reads J columns from its start, and the last tile of the
+    // last expert with tokens starts at most J-1 columns before the end of the buffer, so the padding must cover
+    // the largest J that mul_mat_q_switch_J can pick. It picks J from ncols_opt <= ne12 (tokens), NOT from ne11,
+    // which is 1 (gate/up: broadcast activations) or n_expert_used (down) here: sizing the padding by ne11 gave
+    // 0 or 8 columns while J goes up to 128, i.e. reads of up to ~17 KB past the end of the pool allocation,
+    // an illegal address whenever the allocation ends within that distance of the VMM pool's mapped end
+    // (seen as "MUL_MAT_ID failed / illegal memory access" with 2 concurrent prompts on an A6000).
+    // The bound is 128 (switch_J's largest J), not J_max(ne12): for a few tokens J_max can be 0 (J = 8 not a valid
+    // config for the type) while switch_J picks 16. 128 columns cost ~18 KB of pool memory per call.
+    const int64_t J_pad = std::max<int64_t>(128, ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, GGML_PAD(ne12, 8)));
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        J_pad * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+
+    // Debug: GGML_CUDA_MMQ_PAD_CHECK=1 measures how far the last expert's last tile reads past the y data
+    // (synchronizes the stream: debugging only) and reports it against the old (ne11-based) and current padding.
+    static const bool pad_check = [] { const char * e = getenv("GGML_CUDA_MMQ_PAD_CHECK"); return e && atoi(e) != 0; }();
+    if (pad_check) {
+        std::vector<int32_t> eb(ne02 + 1);
+        CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const int    id    = ggml_cuda_get_device();
+        const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+        int J_best = 0, nt_best = INT_MAX; // same choice as mul_mat_q_switch_J (ncols_opt = ne12 on NVIDIA)
+        for (int J = 8; J <= 128 && nt_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+            if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+            const int nt = (ne12 + J - 1) / J;
+            if (nt < nt_best) { J_best = J; nt_best = nt; }
+        }
+        int64_t last = -1;
+        for (int64_t e = ne02 - 1; e >= 0; --e) { if (eb[e + 1] > eb[e]) { last = e; break; } }
+        if (last >= 0 && J_best > 0) {
+            const int64_t c       = eb[last + 1] - eb[last];
+            const int64_t start   = eb[last] + ((c - 1) / J_best) * J_best;
+            const int64_t over    = start + J_best - ne_get_rows; // columns read past the y data
+            const int64_t pad_old = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
+            static int64_t worst = 0;
+            const int64_t past_old = (over - pad_old)*(int64_t) sizeof(block_q8_1_mmq);
+            if (past_old > worst) {
+                worst = past_old;
+                GGML_LOG_WARN("%s: MUL_MAT_ID %s ne11=%lld ne12=%lld J=%d: last expert %lld has %lld cols, tile reads %lld cols "
+                              "past the y data; old pad %lld cols -> %lld bytes past the allocation, new pad %lld cols -> %lld\n",
+                              __func__, src0->name, (long long) ne11, (long long) ne12, J_best, (long long) last, (long long) c,
+                              (long long) over, (long long) pad_old, (long long) past_old, (long long) J_pad,
+                              (long long) ((over - J_pad)*(int64_t) sizeof(block_q8_1_mmq)));
+            }
+        }
+    }
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
         src1_scale.alloc(ne12*n_expert_used);
@@ -314,13 +366,14 @@ void ggml_cuda_mul_mat_q(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+    args.y_pad_cols = J_pad;
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
