@@ -202,6 +202,15 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
     uint32_t s[TQ_STEPS_LANE];
     tq_states4<type>(b->qs, l, s);
 
+#ifndef GGML_CUDA_TQ_F32_DOT
+    // The int8 codebook already is int8 with one scale: no decode to float and per-lane requantization.
+#pragma unroll
+    for (int i = 0; i < TQ_STEPS_LANE; ++i) {
+        const uint32_t xh = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        q[i] = (int) ((uint32_t) tq_lut_i8[xh >> 21] | ((uint32_t) tq_lut_i8[(xh >> 10) & 2047u] << 16));
+    }
+    return __half2float(b->d) * TQ_LUT_I8_SCALE;
+#else
     const uint32_t * lut = tq_lut_global();
     float v[16];
     float amax = 0.0f;
@@ -226,4 +235,5 @@ static __device__ __forceinline__ float tq_lane_to_q8(const void * x, const int 
         q[i] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((uint32_t) (q3 & 0xFF) << 24);
     }
     return __half2float(b->d) * (amax * (1.0f/127.0f));
+#endif
 }
