@@ -1380,6 +1380,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_high = expert_bounds[zt + 1];
     const int col_diff = col_high - col_low;
 
+    // A tile past the expert's last column: mul_mat_q skipped it and wrote nothing, and its ids would be read
+    // up to ncols_max entries past the end of ids_dst (compute-sanitizer, exact-size pool). Uniform per block.
+    if (jt*J >= col_diff) {
+        return;
+    }
+
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
         ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
     }
