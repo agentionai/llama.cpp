@@ -11,6 +11,7 @@
 // Vulkan shaders: lane l owns steps 4l..4l+3 = weights 16l..16l+15.
 
 #include "common.cuh"
+#include "tq-lut-i8.cuh"
 
 #define TQ_LUT_POINTS   2048
 #define TQ_LANES        8   // lanes per 128-weight block
@@ -122,6 +123,19 @@ static __device__ __forceinline__ float vec_dot_tq_q8_1(
 
     const block_q8_1 * b8 = bq8_1 + l/2;
     const int * q8 = (const int *) b8->qs + 4*(l & 1);
+
+#ifndef GGML_CUDA_TQ_F32_DOT
+    // int8 codebook (one global scale) + dp4a: a step's 4 weights are two 2-byte codebook
+    // entries packed into one int, so each step is one integer dot product with 4 q8_1 values.
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < TQ_STEPS_LANE; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        const uint32_t w = (uint32_t) tq_lut_i8[x >> 21] | ((uint32_t) tq_lut_i8[(x >> 10) & 2047u] << 16);
+        sumi = ggml_cuda_dp4a((int) w, q8[i], sumi);
+    }
+    return __half2float(b->d) * (__low2float(b8->ds) * TQ_LUT_I8_SCALE) * (float) sumi;
+#else
     const uint32_t * lut = tq_lut_global();
 
     float sum = 0.0f;
@@ -134,6 +148,7 @@ static __device__ __forceinline__ float vec_dot_tq_q8_1(
              + p1.x * (float) (int8_t) (v >> 16) + p1.y * (float) (int8_t) (v >> 24);
     }
     return __half2float(b->d) * __low2float(b8->ds) * sum;
+#endif
 }
 
 // MMQ (batched) path: lane l of block x as 16 int8 values (4 packed ints, weight order) with
