@@ -199,8 +199,12 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        // The last tile reads up to ntiles*J - ne11 columns past the last channel's y data. J_max(ne11) rounds
+        // ne11 down to a valid J and is 0 when J = 8 is not a valid config for the type (TQ types), while
+        // switch_J picks the smallest J covering ne11 (16 for 9 columns): pad by switch_J's largest J, 128.
+        const int64_t J_pad = std::max<int64_t>(128, ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11));
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            J_pad * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -231,13 +235,14 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
-        const mmq_args args = {
+        mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
+        args.y_pad_cols = J_pad;
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
