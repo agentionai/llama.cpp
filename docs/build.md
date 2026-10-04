@@ -289,6 +289,10 @@ Currently supported values: `auto`, `q8`, `q4`.
 
 NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
 
+#### GGML_CUDA_TQ_MMVQ_ROWS, GGML_CUDA_TQ_MMVQ_WIDE, GGML_CUDA_TQ_MMQ
+
+Kernel layout switches for the trellis quant types (TQ2_T, TQK6, TQK7). The defaults depend on the GPU generation; see [CUDA-TQ.md](backend/CUDA-TQ.md).
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
