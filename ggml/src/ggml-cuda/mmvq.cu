@@ -1098,6 +1098,22 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// The trellis types' multi-row mat-vec layouts at ncols_dst == 1 (GGML_CUDA_TQ_MMVQ_ROWS: several rows per block,
+// GGML_CUDA_TQ_MMVQ_WIDE: 16 rows per block at small K). Unset: on up to Ada Lovelace, where they cut the expert
+// mat-vec time (RTX 3090: gate/up -41%, down -24%), off from Blackwell (cc >= 12.0), where they cost 0.3-0.5%
+// end to end (RTX 5090). Set: 0 turns the layout off, anything else on, on any GPU.
+static bool ggml_cuda_tq_mmvq_layout(const int env, const int cc) {
+    if (env >= 0) {
+        return env != 0;
+    }
+    return !(GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL);
+}
+
+static int ggml_cuda_tq_mmvq_env(const char * name) {
+    const char * e = getenv(name);
+    return e ? (atoi(e) != 0) : -1;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1162,8 +1178,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // shares the block's shared-memory codebook load. Only when the rows divide evenly: the kernel does
             // not guard its weight reads past the last row (expert matrices: 640 / 2560 rows).
             if (ncols_dst == 1 && ggml_cuda_type_is_tq(type) && nwarps > 1 && nrows_x % nwarps == 0) {
-                static const bool tq_rows = [] { const char * e = getenv("GGML_CUDA_TQ_MMVQ_ROWS"); return !e || atoi(e) != 0; }();
-                use = use || tq_rows;
+                static const int tq_rows_env = ggml_cuda_tq_mmvq_env("GGML_CUDA_TQ_MMVQ_ROWS");
+                use = use || ggml_cuda_tq_mmvq_layout(tq_rows_env, cc);
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
@@ -1231,8 +1247,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            static const bool tq_wide_env = [] { const char * e = getenv("GGML_CUDA_TQ_MMVQ_WIDE"); return !e || atoi(e) != 0; }();
-            const bool tq_wide = ggml_cuda_type_is_tq(type) && tq_wide_env && blocks_per_row_x <= 8 &&
+            static const int tq_wide_env = ggml_cuda_tq_mmvq_env("GGML_CUDA_TQ_MMVQ_WIDE");
+            const bool tq_wide = ggml_cuda_type_is_tq(type) && ggml_cuda_tq_mmvq_layout(tq_wide_env, cc) && blocks_per_row_x <= 8 &&
                                  nrows_x % (4*calc_nwarps(type, c_ncols_dst, table_id)) == 0;
             if (should_use_small_k(c_ncols_dst)) {
                 if (tq_wide) {
