@@ -219,7 +219,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             dp.n_threads   = params.ple_io_threads;
             dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
             dp.direct_io   = params.ple_direct_io;
-            ple_disk = std::make_shared<llama_ple_disk>(params.path_ple, offs, pe_type, ne[0], ple_rows, dp);
+            try {
+                ple_disk = std::make_shared<llama_ple_disk>(params.path_ple, offs, pe_type, ne[0], ple_rows, dp);
+            } catch (const std::exception & e) {
+                // no mmap fallback here: the main loader never sees the sidecar's table
+                throw std::runtime_error(format("--model-ple: cannot read the n-gram table from '%s': %s",
+                                                params.path_ple, e.what()));
+            }
             LLAMA_LOG_INFO("%s: PLE n-gram table read from sidecar '%s': %s\n",
                             __func__, params.path_ple, ple_disk->describe().c_str());
 
@@ -246,13 +252,30 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 dp.n_threads   = params.ple_io_threads;
                 dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
                 dp.direct_io   = params.ple_direct_io;
-                ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(w->idx), w->offs,
-                                                            w->tensor->type, w->tensor->ne[0], ple_rows, dp);
+                try {
+                    ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(w->idx), w->offs,
+                                                                w->tensor->type, w->tensor->ne[0], ple_rows, dp);
+                } catch (const std::exception & e) {
+                    // the table is in the model file, so it can still be read on demand through
+                    // the mapping, as --lazy-mode on does: slower than the direct reader, but the
+                    // model loads and the table still never has to be resident
+                    LLAMA_LOG_WARN("%s: --ngram-on-disk direct reader unavailable (%s); "
+                                   "falling back to --lazy-mode on for the PLE n-gram table\n", __func__, e.what());
+                    ple_disk.reset();
+                }
+            }
+            if (ple_disk) {
                 LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
                 create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
             } else {
+                // --ngram-on-disk without its reader means lazy for this tensor, whatever --lazy-mode says
+                const llama_lazy_mode lazy_mode = ml.lazy.mode;
+                if (params.ple_on_disk) {
+                    ml.lazy.mode = LLAMA_LAZY_MODE_ON;
+                }
                 per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                                    { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                ml.lazy.mode = lazy_mode;
             }
         } else if (ml.get_weight(tn(LLM_TENSOR_PLE_NGRAM_EMBD, "weight", 0).str().c_str()) == nullptr) {
             // no table at all: a model synthesised from metadata. The head ranges are what the
