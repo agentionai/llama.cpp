@@ -2711,10 +2711,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- on-direct: like on, but the qwen4exp n-gram table is read with explicit positional reads\n"
+        "  (direct I/O unless --no-ngram-direct-io) instead of through the mmap; same as on + --ngram-on-disk\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_ON; params.ple_on_disk = true; }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
@@ -2761,7 +2764,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--ngram-on-disk"},
         "keep the model's n-gram hash-embedding table (per_layer_token_embd, 28.8 GB on Qwen3.8-Flash-Next)\n"
         "on disk: it is never mapped or loaded, each batch reads just the rows it gathers from the GGUF.\n"
-        "Only qwen4exp has such a table; on any other model this is a no-op",
+        "The n-gram half of --lazy-mode on-direct. If the reader can't start, the table falls back to\n"
+        "--lazy-mode on reads through the mmap. Only qwen4exp has such a table; on any other model this is a no-op",
         [](common_params & params) {
             params.ple_on_disk = true;
         }
@@ -2793,7 +2797,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ngram-direct-io"},
         {"--no-ngram-direct-io"},
-        string_format("read n-gram rows with O_DIRECT so they bypass the page cache (default: %s)", params.ple_direct_io ? "enabled" : "disabled"),
+        string_format("read n-gram rows with O_DIRECT (FILE_FLAG_NO_BUFFERING on Windows) so they bypass the page cache (default: %s)", params.ple_direct_io ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.ple_direct_io = value;
         }
