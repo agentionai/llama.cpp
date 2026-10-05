@@ -7,8 +7,8 @@
 #include <string>
 
 // A weight table that stays in the GGUF file. Nothing is mapped or loaded for it at
-// model load; each batch reads exactly the rows it gathers, with pread, and hands
-// them over dequantized.
+// model load; each batch reads exactly the rows it gathers with positional reads
+// (pread, or overlapped ReadFile on Windows), and hands them over dequantized.
 //
 // Built for the qwen4exp n-gram hash embedding (per_layer_token_embd): 320 M rows of
 // 90 bytes, a third of the model's bytes, of which one token touches 16 at unrelated
@@ -19,7 +19,7 @@ struct llama_ple_disk {
     struct params {
         int32_t n_threads   = 64;         // parallel readers: random reads on NVMe need queue depth
         size_t  cache_bytes = 256u << 20; // direct-mapped cache of raw rows; 0 disables
-        bool    direct_io   = true;       // O_DIRECT, so the rows never enter the page cache either
+        bool    direct_io   = true;       // O_DIRECT / FILE_FLAG_NO_BUFFERING, so the rows never enter the page cache either
     };
 
     llama_ple_disk(const std::string & fname, size_t offs, ggml_type type, int64_t ne0, int64_t nrows, const params & p);
