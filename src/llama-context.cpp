@@ -466,6 +466,16 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [TAG_KV_ZERO_FREED] freeing cells zeroes them from the host; wait for our graphs first
+        memory_sync = std::make_shared<std::function<void()>>([this]() { synchronize(); });
+        if (memory) {
+            memory->add_sync(memory_sync);
+        }
+        // our caches may mirror mem_other's cells, and freeing cells there zeroes our rows too
+        if (params_mem.mem_other) {
+            params_mem.mem_other->add_sync(memory_sync);
+        }
     }
 
     // init backends
@@ -2005,6 +2015,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
+                // [TAG_KV_ZERO_FREED] seq_rm zeroes the freed cells from the host
+                memory->sync();
                 memory->seq_rm(s, pos_min[s], -1);
             }
 
@@ -3683,6 +3695,8 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
+    // [TAG_KV_ZERO_FREED]
+    memory->sync();
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
@@ -4244,6 +4258,9 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    // [TAG_KV_ZERO_FREED]
+    mem->sync();
+
     mem->clear(data);
 }
 
@@ -4255,6 +4272,9 @@ bool llama_memory_seq_rm(
     if (!mem) {
         return true;
     }
+
+    // [TAG_KV_ZERO_FREED] the freed cells are zeroed right away, so no graph may still be writing them
+    mem->sync();
 
     return mem->seq_rm(seq_id, p0, p1);
 }
@@ -4269,6 +4289,9 @@ void llama_memory_seq_cp(
         return;
     }
 
+    // [TAG_KV_ZERO_FREED] a whole-sequence copy overwrites the destination's cells (and may free them)
+    mem->sync();
+
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -4278,6 +4301,9 @@ void llama_memory_seq_keep(
     if (!mem) {
         return;
     }
+
+    // [TAG_KV_ZERO_FREED]
+    mem->sync();
 
     mem->seq_keep(seq_id);
 }

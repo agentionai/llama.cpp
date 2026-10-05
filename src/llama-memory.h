@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -124,6 +125,32 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // [TAG_KV_ZERO_FREED] synchronization with in-flight graphs
+    //
+    // The KV caches zero every cell they free (seq_rm, seq_keep, clear) with host-side tensor writes,
+    // outside of any graph. Those writes must not race a graph that is still running asynchronously
+    // and reads or writes the same rows (e.g. a decode immediately followed by seq_rm, with no output
+    // read in between: the decode's K/V stores land after the zeroing and leave stale rows behind).
+    // llama_context registers its synchronize() here, for its own memory and for the memory its
+    // caches mirror (mem_other); the public llama_memory_* API calls sync() before such operations.
+    // Entries of contexts that have been freed have expired and are skipped.
+
+    void add_sync(const std::shared_ptr<std::function<void()>> & fn) {
+        syncs.push_back(fn);
+    }
+
+    void sync() const {
+        for (const auto & w : syncs) {
+            if (auto fn = w.lock()) {
+                (*fn)();
+            }
+        }
+    }
+
+private:
+    std::vector<std::weak_ptr<std::function<void()>>> syncs;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
