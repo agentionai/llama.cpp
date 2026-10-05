@@ -109,13 +109,21 @@ static double nmse(const float * a, const float * b, int n) {
 // ubatches while its rollback restore is still pending. Compared against a
 // reference context that never advanced past the rollback point and decodes
 // the identical replay batch.
+//
+// The rolled-back tokens are the last n_rollback of a longer ubatch: in the recurrent
+// memory a ubatch of n tokens writes the snapshots for rollbacks of 0..n-1 tokens only
+// (the state from before the ubatch is not one of them), so a rollback of the whole
+// ubatch is refused there. The reference decodes the n_keep surviving tail tokens as
+// their own batch.
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
     constexpr uint32_t  n_seqs     = 2;
     constexpr uint32_t  n_ubatch   = 16;
     constexpr uint32_t  n_prompt   = 19;
     constexpr uint32_t  n_rollback = 3;
+    constexpr uint32_t  n_keep     = 2;  // tail tokens that survive the rollback
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
+    constexpr llama_pos p_tail     = p0 - n_keep;
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -152,18 +160,26 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // both contexts decode the identical [0, p_tail) prefill; ctx_roll decodes the
+    // whole tail [p_tail, n_prompt) as one ubatch and rolls back its last n_rollback
+    // tokens, so its restore is pending at replay; ctx_ref decodes [p_tail, p0) only.
+    // No output is read in between: seq_rm must not race the decode still in flight.
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+        for (llama_pos pos = 0; pos < (llama_pos) p_tail; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
         ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        for (llama_pos pos = p_tail; pos < (llama_pos) p0; ++pos) {
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+        }
+        ok = ok && llama_decode(ctx_ref, batch) == 0;
+
+        common_batch_clear(batch);
+        for (llama_pos pos = p_tail; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
@@ -345,6 +361,8 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     const llama_pos rollback_pos = (llama_pos) n_tokens - n_rollback;
 
     // Decode the full prompt on the source, then roll back three positions.
+    // Nothing reads the decode's output first, so seq_rm meets the decode still in flight
+    // on an asynchronous backend; the cells it frees must still end up zeroed (no stale K/V).
     // Replaying them crosses DSV4's ratio-4 compressor boundary.
     // Rollback leaves the recurrent memory in a snapshot state (rs_idx != 0).
     if (!decode_tokens(ctx_src, tokens, n_tokens)) {

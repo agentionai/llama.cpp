@@ -83,8 +83,12 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
-    // per-seq: the last ubatch wrote its rollback snapshots (see llama_rs_keep_snapshots)
-    std::vector<uint8_t> rs_snap_ok;
+    // per-seq: how many rollback snapshot slots the last ubatch wrote. Slot r holds the state r tokens
+    // before the end of that ubatch, and the recurrent ops write only slots 0..min(n_seq_tokens, n_rs_seq + 1)-1
+    // (the state from before the ubatch is not one of them), so a rollback of r tokens is valid only for
+    // r < rs_snap_n. 0 when the last ubatch kept no snapshots (llama_rs_keep_snapshots), after a clear and
+    // after a state restore, whose snapshot planes are not part of the saved state.
+    std::vector<uint32_t> rs_snap_n;
 
     void note_rs_snapshots(const llama_ubatch & ubatch);
 
