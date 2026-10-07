@@ -7509,7 +7509,41 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
-void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst) {
+// SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST(src2), consecutive (graph_optimize keeps hc_post_act_pattern
+// together): the scatter weights 2*sigmoid(inject/hc) of a qwen4exp hyper-connection combine are computed
+// inside the hc_post kernel, 3 dispatches fewer per combine.
+static bool ggml_vk_can_fuse_hc_post_act(const ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * s0 = cgraph->nodes[i];
+    const ggml_tensor * sg = cgraph->nodes[i + 1];
+    const ggml_tensor * s1 = cgraph->nodes[i + 2];
+    const ggml_tensor * hp = cgraph->nodes[i + 3];
+    if (s0->op != GGML_OP_SCALE || sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID ||
+        s1->op != GGML_OP_SCALE || hp->op != GGML_OP_DSV4_HC_POST) {
+        return false;
+    }
+    if (sg->src[0] != s0 || s1->src[0] != sg || hp->src[2] != s1) {
+        return false;
+    }
+    for (int k = 0; k < 4; ++k) {
+        if ((cgraph->nodes[i + k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    for (int k = 0; k < 3; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if (!ggml_node_has_n_uses(cgraph, i + k, 1) || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    const ggml_tensor * raw = s0->src[0];
+    return raw->type == GGML_TYPE_F32 && ggml_is_contiguous(raw) && ggml_are_same_shape(raw, s1);
+}
+
+void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst,
+                          const ggml_tensor * act_scale0, const ggml_tensor * act_scale1) {
     VK_LOG_DEBUG("ggml_vk_dsv4_hc_post(" << x << ", " << residual << ", " << post << ", " << comb << ", " << dst << ")");
 
     vk_pipeline pipeline = comb ? ctx->device->pipeline_dsv4_hc_post_f32 : ctx->device->pipeline_dsv4_hc_post_nocomb_f32;
@@ -7534,7 +7568,15 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
         comb ? ggml_vk_nb_elem(comb, 0) : 0, comb ? ggml_vk_nb_elem(comb, 1) : 0, comb ? ggml_vk_nb_elem(comb, 2) : 0,
         ggml_vk_nb_elem(dst,  0), ggml_vk_nb_elem(dst,  1), ggml_vk_nb_elem(dst,  2),
         0, 0, 0, 0, 0,
+        1.0f, 0.0f, 1.0f, 0.0f, 0,
     };
+    if (act_scale0 && act_scale1) {
+        pc.act_s0 = ggml_get_op_params_f32(act_scale0, 0);
+        pc.act_b0 = ggml_get_op_params_f32(act_scale0, 1);
+        pc.act_s1 = ggml_get_op_params_f32(act_scale1, 0);
+        pc.act_b1 = ggml_get_op_params_f32(act_scale1, 1);
+        pc.act    = 1;
+    }
     init_pushconst_tensor_offsets(ctx, pc, x, residual, post, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
@@ -12772,6 +12814,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
+        if (ctx->fused_hc_post_act) {
+            ggml_tensor * hc_post = cgraph->nodes[node_idx + 3];
+            ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], src0, hc_post->src[3], hc_post,
+                                 node, cgraph->nodes[node_idx + 2]);
+            break;
+        }
         ggml_vk_scale(ctx, compute_ctx, src0, node);
 
         break;
@@ -14703,6 +14751,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_hc_post_act = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14823,6 +14872,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_vk_can_fuse_hc_post_act(cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_hc_post_act = true;
+                fusion_string = "HC_POST_ACT";
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -14937,6 +14991,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_hc_post_act = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -15102,7 +15157,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         for (int j = 0; j < graph->n_nodes; ++j) {
             if (ops_at(topk_moe_early_softmax_norm, j) || ops_at(topk_moe_sigmoid_norm_bias, j) ||
                 ops_at(topk_moe_sqrt_softplus_norm_bias, j) || ops_at(topk_moe_early_softmax, j) ||
-                ops_at(topk_moe_late_softmax, j) || ops_at(snake_pattern, j) ||
+                ops_at(topk_moe_late_softmax, j) || ops_at(snake_pattern, j) || ops_at(hc_post_act_pattern, j) ||
                 ops_at(rms_norm_mul_add_mul_pattern, j) || ops_at(rms_norm_mul_add_pattern, j) ||
                 ops_at(rms_norm_mul_rope_view_set_rows_pattern, j) || ops_at(rms_norm_view_set_rows_pattern, j) ||
                 ops_at(rope_view_set_rows_pattern, j)) {
@@ -15207,6 +15262,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (keep_pattern(hc_post_act_pattern)) {
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -15260,6 +15318,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern(snake_pattern, j) ||
+                match_pattern(hc_post_act_pattern, j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||

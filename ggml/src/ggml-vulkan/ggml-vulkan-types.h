@@ -544,6 +544,9 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 6, 0, 5 }, // top_k->src[0]   == add
 };
 
+// qwen4exp hyper-connection combine: post = 2*sigmoid(inject/hc) fused into DSV4_HC_POST
+static constexpr std::initializer_list<ggml_op> hc_post_act_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
@@ -1286,6 +1289,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_hc_post_act {};
     // CPY of gated-delta-net state snapshots into the recurrent cache that the GDN dispatch already did
     const ggml_tensor * gdn_elided_cpy {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

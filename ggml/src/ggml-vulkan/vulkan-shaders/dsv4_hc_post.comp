@@ -33,6 +33,12 @@ layout(push_constant) uniform parameter
     uint p_offset;
     uint c_offset;
     uint d_offset;
+
+    // act != 0: post = act_s1*sigmoid(post*act_s0 + act_b0) + act_b1, i.e. the SCALE, SIGMOID,
+    // SCALE chain that turns the raw injection into scatter weights, fused into this op.
+    float act_s0; float act_b0;
+    float act_s1; float act_b1;
+    uint act;
 };
 
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
@@ -51,7 +57,14 @@ void main() {
     const uint it  = gl_WorkGroupID.y;
 
     if (tid < hc) {
-        post_s[tid] = data_p[p_offset + tid * nbp0 + it * nbp1];
+        float pv = data_p[p_offset + tid * nbp0 + it * nbp1];
+        if (act != 0) {
+            // same arithmetic as scale.comp and op_sigmoid in unary.comp
+            pv = pv * act_s0 + act_b0;
+            pv = 1.0f / (1.0f + exp(-pv));
+            pv = pv * act_s1 + act_b1;
+        }
+        post_s[tid] = pv;
     }
     if (HAS_COMB == 1 && tid < hc * hc) {
         const uint idst = tid & 3;
