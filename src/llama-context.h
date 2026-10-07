@@ -385,6 +385,24 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // Graph slots: small ubatches (speculative verify widths, MTP draft catch-up and step graphs, single-token
+    // decode) each keep their own scheduler and graph, so alternating shapes reuse their graphs instead of
+    // rebuilding and re-splitting on every change. The active slot's scheduler and graphs live in `sched`,
+    // `gf_res_prev` and `gf_res_prev_active`; the others are parked here. Key 0 is the main scheduler.
+    // LLAMA_GRAPH_SLOTS=0 disables.
+    struct graph_slot {
+        ggml_backend_sched_ptr               sched;
+        std::array<llm_graph_result_ptr, 2>  res;
+        llm_graph_result *                   active = nullptr;
+    };
+    std::map<int, graph_slot> graph_slots;
+    int  graph_slot_cur      = 0;
+    int  graph_slots_enabled = -1; // -1: not decided yet
+    size_t graph_slot_max_nodes = 0;
+
+    void graph_slot_select(int key);
+    void graph_slots_invalidate(); // parked graphs can no longer be reused
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
