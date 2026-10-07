@@ -720,6 +720,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    graph_slot_select(0);
+    graph_slots.clear();
+    graph_slot_max_nodes = max_nodes;
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -974,6 +977,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        graph_slots_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1496,6 +1500,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (graph_slots_enabled < 0) {
+        const char * e = getenv("LLAMA_GRAPH_SLOTS");
+        graph_slots_enabled = (e == nullptr || atoi(e) != 0) && !cparams.pipeline_parallel && !graph_reuse_disable ? 1 : 0;
+    }
+    if (graph_slots_enabled == 1) {
+        // one slot per small (n_tokens, n_outputs, graph type); larger ubatches use the main scheduler
+        const int key = ubatch.n_tokens <= 8 ? 1 + (int) ubatch.n_tokens * 16 + std::min<int>(n_outputs, 15) + 1024 * (int) gtype : 0;
+        graph_slot_select(key);
     }
 
     auto * res = get_gf_res_prev();
@@ -2524,6 +2538,47 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+void llama_context::graph_slot_select(int key) {
+    if (key == graph_slot_cur) {
+        return;
+    }
+    if (sched) {
+        // the parked scheduler's last graph may still be running
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    auto & park = graph_slots[graph_slot_cur];
+    park.sched  = std::move(sched);
+    park.res    = std::move(gf_res_prev);
+    park.active = gf_res_prev_active;
+
+    auto it = graph_slots.find(key);
+    if (it != graph_slots.end() && it->second.sched) {
+        sched              = std::move(it->second.sched);
+        gf_res_prev        = std::move(it->second.res);
+        gf_res_prev_active = it->second.active;
+    } else {
+        // a fresh scheduler: its compute buffers are sized by the first graph it allocates
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                graph_slot_max_nodes, false, cparams.op_offload));
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
+        gf_res_prev_active = nullptr;
+    }
+    graph_slot_cur = key;
+}
+
+void llama_context::graph_slots_invalidate() {
+    for (auto & [key, slot] : graph_slots) {
+        for (auto & res : slot.res) {
+            if (res) {
+                res->reset();
+            }
+        }
+        slot.active = nullptr;
+    }
+}
+
 llm_graph_result * llama_context::get_gf_res_prev() {
     auto & res = gf_res_prev[n_outputs > 0];
     if (!res) {
@@ -2606,6 +2661,10 @@ ggml_cgraph * llama_context::graph_reserve(
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
+
+    // reservations size the main scheduler's buffers
+    graph_slot_select(0);
+    graph_slots_invalidate();
 
     ggml_backend_sched_reset(sched.get());
 
