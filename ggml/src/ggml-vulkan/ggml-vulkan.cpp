@@ -4015,7 +4015,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -10510,7 +10510,50 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {dispatch_x, dispatch_y, 1});
 }
 
-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// The CPY that moves a gated delta net's state snapshots (or its final state) from the op's output into
+// the recurrent cache, i.e. CPY(view of dst at the snapshot area -> cache view [D, n_seqs, n_slots]).
+// Returns its node index when the GDN dispatch can write the snapshots into the cache itself, else -1.
+static int ggml_vk_find_gdn_state_cpy(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = [] {
+        const char * e = getenv("GGML_VK_GDN_DIRECT_STATE");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (disabled || gdn->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    const ggml_tensor * src_v = gdn->src[2];
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t D        = S_v * S_v * H;
+    const int64_t n_slots  = std::min<int64_t>(n_tokens, std::max<int64_t>(K, 1));
+    const size_t  s_off_b  = (size_t) (S_v * H * n_tokens * n_seqs) * sizeof(float);
+
+    // the graph optimizer keeps the copy close: it depends on nothing but the GDN output
+    const int end = std::min(cgraph->n_nodes - 8, node_idx + 24);
+    for (int j = node_idx + 1; j < end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_CPY || n->src[0]->view_src != gdn) {
+            continue;
+        }
+        const ggml_tensor * sv = n->src[0];
+        const ggml_tensor * dv = n->src[1];
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            sv->type != GGML_TYPE_F32 || dv->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) ||
+            sv->view_offs != s_off_b || ggml_nelements(sv) != D * n_seqs * n_slots ||
+            dv->ne[0] != D || dv->ne[1] != n_seqs || dv->ne[2] != n_slots || dv->ne[3] != 1 ||
+            dv->nb[0] != sizeof(float) || dv->nb[1] % sizeof(float) != 0 || dv->nb[2] % sizeof(float) != 0) {
+            return -1;
+        }
+        return j;
+    }
+    return -1;
+}
+
+void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * cache_dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -10552,18 +10595,28 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
+    vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        0, 0, 0, 0,
     };
 
+    vk_subbuffer cache_buf = dst_buf;
+    if (cache_dst) {
+        cache_buf = ggml_vk_tensor_subbuffer(ctx, cache_dst);
+        pc.c_on          = 1;
+        pc.c_off         = 0;
+        pc.c_seq_stride  = (uint32_t)(cache_dst->nb[1] / sizeof(float));
+        pc.c_slot_stride = (uint32_t)(cache_dst->nb[2] / sizeof(float));
+    }
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -12492,6 +12545,13 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
 
+    if (node->op == GGML_OP_CPY && node == ctx->gdn_elided_cpy) {
+        // done by the gated delta net dispatch (ggml_vk_find_gdn_state_cpy)
+        ctx->gdn_elided_cpy = nullptr;
+        return false;
+    }
+    const int gdn_state_cpy = node->op == GGML_OP_GATED_DELTA_NET ? ggml_vk_find_gdn_state_cpy(cgraph, node_idx) : -1;
+
     ggml_tensor * src0 = node->src[0];
     ggml_tensor * src1 = node->src[1];
     ggml_tensor * src2 = node->src[2];
@@ -12550,6 +12610,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             }
             return false;
         };
+
+        // The GDN dispatch also writes the cache view of the CPY it absorbs.
+        if (gdn_state_cpy >= 0) {
+            const ggml_tensor * cache_view = cgraph->nodes[gdn_state_cpy]->src[1];
+            need_sync = overlaps_unsynced(cache_view, ctx->unsynced_nodes_read) || overlaps_unsynced(cache_view, ctx->unsynced_nodes_written);
+        }
 
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
@@ -12997,7 +13063,15 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        if (gdn_state_cpy >= 0) {
+            // the snapshots go straight into the cache; the CPY node is skipped when its turn comes
+            const ggml_tensor * cpy = cgraph->nodes[gdn_state_cpy];
+            ggml_vk_gated_delta_net(ctx, compute_ctx, node, cpy->src[1]);
+            ctx->gdn_elided_cpy = cpy;
+            ctx->unsynced_nodes_written.push_back(cpy->src[1]);
+        } else {
+            ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        }
 
         break;
 

@@ -32,6 +32,12 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // c_on != 0: the state snapshots go straight into the recurrent cache (binding 7) instead of the
+    // snapshot area of dst, replacing the CPY that would move them there. Element offsets/strides.
+    uint c_on;
+    uint c_off;
+    uint c_seq_stride;
+    uint c_slot_stride;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -41,6 +47,7 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7) writeonly buffer CacheBuf { FLOAT_TYPE data_cache[]; };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -107,6 +114,7 @@ void main() {
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
+    const uint cache_base          = c_off + seq_id * c_seq_stride + head_id * state_size;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
@@ -173,17 +181,30 @@ void main() {
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                if (c_on != 0u) {
+                    const uint slot_base = cache_base + uint(target_slot) * c_slot_stride;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_cache[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                    }
+                } else {
+                    const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                    }
                 }
             }
         }
     }
 
     if (K == 1u) {
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        if (c_on != 0u) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_cache[cache_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            }
+        } else {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            }
         }
     }
 }
