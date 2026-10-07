@@ -389,7 +389,7 @@ private:
     // decode) each keep their own scheduler and graph, so alternating shapes reuse their graphs instead of
     // rebuilding and re-splitting on every change. The active slot's scheduler and graphs live in `sched`,
     // `gf_res_prev` and `gf_res_prev_active`; the others are parked here. Key 0 is the main scheduler.
-    // LLAMA_GRAPH_SLOTS=0 disables.
+    // On by default when every GPU backend is Vulkan; LLAMA_GRAPH_SLOTS=1/0 forces it on/off.
     struct graph_slot {
         ggml_backend_sched_ptr               sched;
         std::array<llm_graph_result_ptr, 2>  res;
