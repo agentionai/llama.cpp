@@ -563,6 +563,9 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // the expected compute buffer sizes are those of the main scheduler
+    graph_slot_select(0);
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -3651,6 +3654,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            // graph slots: the parked schedulers' compute buffers
+            for (const auto & [key, slot] : graph_slots) {
+                if (slot.sched) {
+                    ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+                }
+            }
         }
     }
     return ret;
