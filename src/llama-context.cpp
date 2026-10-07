@@ -1506,8 +1506,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (graph_slots_enabled < 0) {
+        // default: on only when every GPU backend is Vulkan (measured there); LLAMA_GRAPH_SLOTS=1/0 forces it on/off
+        bool all_vk = false;
+        for (const auto & b : backends) {
+            const auto t = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
+            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            if (strncmp(ggml_backend_name(b.get()), "Vulkan", 6) != 0) {
+                all_vk = false;
+                break;
+            }
+            all_vk = true;
+        }
         const char * e = getenv("LLAMA_GRAPH_SLOTS");
-        graph_slots_enabled = (e == nullptr || atoi(e) != 0) && !cparams.pipeline_parallel && !graph_reuse_disable ? 1 : 0;
+        const bool want = e != nullptr ? atoi(e) != 0 : all_vk;
+        graph_slots_enabled = want && !cparams.pipeline_parallel && !graph_reuse_disable ? 1 : 0;
     }
     if (graph_slots_enabled == 1) {
         // one slot per small (n_tokens, n_outputs, graph type); larger ubatches use the main scheduler
