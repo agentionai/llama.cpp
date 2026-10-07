@@ -205,6 +205,11 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t p_offset;
     uint32_t c_offset;
     uint32_t d_offset;
+
+    // act != 0: post = act_s1*sigmoid(post*act_s0 + act_b0) + act_b1 (fused SCALE, SIGMOID, SCALE)
+    float act_s0; float act_b0;
+    float act_s1; float act_b1;
+    uint32_t act;
 };
 
 struct vk_op_count_experts_push_constants {
