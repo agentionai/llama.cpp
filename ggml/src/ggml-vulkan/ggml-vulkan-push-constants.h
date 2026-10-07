@@ -699,6 +699,10 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t c_on;          // state snapshots written straight into the recurrent cache (elided CPY)
+    uint32_t c_off;
+    uint32_t c_seq_stride;
+    uint32_t c_slot_stride;
 };
 
 struct vk_op_ssm_scan_push_constants {
