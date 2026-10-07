@@ -15070,7 +15070,41 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     std::vector<ggml_tensor *> new_order;
     std::vector<bool> used(graph->n_nodes, false);
-    std::set<ggml_tensor *> used_node_set;
+    std::unordered_set<ggml_tensor *> used_node_set;
+    used_node_set.reserve(2 * graph->n_nodes);
+
+    // near_pattern[j]: some protected fusion pattern could match at j (op sequence only; the
+    // match_pattern calls below also require the nodes to be unused). Lets the lookahead skip the
+    // per-node pattern checks for the vast majority of nodes.
+    std::vector<uint8_t> near_pattern(graph->n_nodes, 0);
+    {
+        auto const &ops_at = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
+            if (start < 0 || start + (int)pattern.size() > graph->n_nodes) {
+                return false;
+            }
+            for (size_t k = 0; k < pattern.size(); ++k) {
+                if (graph->nodes[start + k]->op != pattern.begin()[k]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (int j = 0; j < graph->n_nodes; ++j) {
+            if (ops_at(topk_moe_early_softmax_norm, j) || ops_at(topk_moe_sigmoid_norm_bias, j) ||
+                ops_at(topk_moe_sqrt_softplus_norm_bias, j) || ops_at(topk_moe_early_softmax, j) ||
+                ops_at(topk_moe_late_softmax, j) || ops_at(snake_pattern, j) ||
+                ops_at(rms_norm_mul_add_mul_pattern, j) || ops_at(rms_norm_mul_add_pattern, j) ||
+                ops_at(rms_norm_mul_rope_view_set_rows_pattern, j) || ops_at(rms_norm_view_set_rows_pattern, j) ||
+                ops_at(rope_view_set_rows_pattern, j)) {
+                near_pattern[j] = 1;
+            }
+            if (ops_at(topk_qsa_pattern, j)) {
+                for (int o = 0; o < (int) topk_qsa_pattern.size() && j + o < graph->n_nodes; ++o) {
+                    near_pattern[j + o] = 1;
+                }
+            }
+        }
+    }
 
     int first_unused = 0;
 
@@ -15088,16 +15122,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
         // Check for fusion patterns and avoid reordering them
         auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
-            if (start + (int)pattern.size() <= graph->n_nodes) {
-                bool is_pattern = true;
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
-                        is_pattern = false;
-                    }
-                }
-                return is_pattern;
+            if (start < 0 || start + (int)pattern.size() > graph->n_nodes) {
+                return false;
             }
-            return false;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
@@ -15211,7 +15244,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
+            if (near_pattern[j] && (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
@@ -15222,7 +15255,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
-                match_pattern(rope_view_set_rows_pattern, j)) {
+                match_pattern(rope_view_set_rows_pattern, j))) {
                 continue;
             }
             bool ok = true;
