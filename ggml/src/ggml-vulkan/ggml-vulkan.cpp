@@ -14537,6 +14537,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    ctx->gdn_elided_cpy = nullptr;
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
